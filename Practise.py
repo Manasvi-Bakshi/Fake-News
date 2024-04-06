@@ -53,6 +53,7 @@ train_inputs, test_inputs, train_labels, test_labels = train_test_split(input_id
 train_masks, test_masks, _, _ = train_test_split(attention_masks, labels, test_size=0.2, random_state=42)
 
 # Define BERT Model Architecture
+
 class BERTClassifier(nn.Module):
     def __init__(self):
         super(BERTClassifier, self).__init__()
