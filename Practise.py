@@ -4,14 +4,12 @@
 
 import torch
 import pandas as pd
-from transformers import BertTokenizer, BertForSequenceClassification
-from torch.nn.functional import softmax
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
 import lightgbm as lgb
 import numpy as np
-import pylance
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import classification_report
+from sklearn.metrics import accuracy_score,precision_score,recall_score,f1_score,classification_report
 
 
 #Load BERT
@@ -26,111 +24,110 @@ true_data = pd.read_csv('True.csv')
 fake_data = pd.read_csv('Fake.csv')
 
 # Generate labels for True/Fake news
-true_data['Target'] = 1
-fake_data['Target'] = 0
+
+true_data['Target'] = ['True']*len(true_data)
+fake_data['Target'] = ['Fake']*len(fake_data)
 
 # Merge and shuffle data
-data = pd.concat([true_data, fake_data]).sample(frac=1).reset_index(drop=True)
+
+fake_news_data = pd.concat([true_data, fake_data]).sample(frac=1).reset_index(drop=True)
+
+# Split the dataset into training and testing sets
+
+train_data, test_data = train_test_split(fake_news_data, test_size=0.2, random_state=42)
+
+# Define BERT tokenizer and model
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
 
 #Tokenization of text using BERT tokenizer
 
-max_length = 128
-input_ids = []
-attention_masks = []
-for text in data:
-    encoded_dict = tokenizer.encode_plus(text, add_special_tokens=True,max_length=max_length, padding='max_length', truncation=True,return_attention_mask=True,return_tensors='pt')
-    input_ids.append(encoded_dict['input_ids'])
-    attention_masks.append(encoded_dict['attention_mask'])
-input_ids = torch.cat(input_ids, dim=0)
-attention_masks= torch.cat(attention_masks, dim=0)
-with torch.no_grad():
-    outputs= bert_model(input_ids, attention_mask=attention_masks)
-bert_embeddings = outputs[0][:,0,:].numpy()
+def tokenize_data(data):
+    tokenized_data = tokenizer(data['title'].tolist(), padding=True, truncation=True, return_tensors="pt")
+    tokenized_data['labels'] = torch.tensor([0 if label == 'True' else 1 for label in data['Target'].tolist()])
+    return tokenized_data
 
-#Splitting Data into train and test set 
+train_tokenized = tokenize_data(train_data)
+test_tokenized = tokenize_data(test_data)
 
-train_inputs, test_inputs, train_labels, test_labels = train_test_split(input_ids, labels, test_size=0.2, random_state=42)
-train_masks, test_masks, _, _ = train_test_split(attention_masks, labels, test_size=0.2, random_state=42)
 
-# Define BERT Model Architecture
+# Custom Dataset class
 
-class BERTClassifier(nn.Module):
-    def __init__(self):
-        super(BERTClassifier, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(768, 1)  # Output size 1 for binary classification
+class NewsDataset(Dataset):
+    def __init__(self, tokenized_data):
+        self.input_ids = tokenized_data['input_ids']
+        self.attention_mask = tokenized_data['attention_mask']
+        self.labels = tokenized_data['labels']
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs[1]  # Output of [CLS] token
-        output = self.dropout(pooled_output)
-        output = self.fc(output)
-        return output
-        
-# Initialize BERT model, optimizer, and loss function
+    def __len__(self):
+        return len(self.input_ids)
 
-model = BERTClassifier()
-optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
-criterion = nn.BCEWithLogitsLoss()
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.input_ids[idx],
+            'attention_mask': self.attention_mask[idx],
+            'labels': self.labels[idx]
+        }
 
-# Train BERT Model
+# Define data loaders
 
-batch_size = 32
-epochs = 3
+train_dataset = NewsDataset(train_tokenized)
+test_dataset = NewsDataset(test_tokenized)
 
-for epoch in range(epochs):
-    model.train()
-    for i in range(0, len(train_inputs), batch_size):
-        optimizer.zero_grad()
-        batch_inputs = train_inputs[i:i+batch_size]
-        batch_masks = train_masks[i:i+batch_size]
-        batch_labels = train_labels[i:i+batch_size]
+training_args = TrainingArguments(
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
+    num_train_epochs=3,
+    evaluation_strategy="epoch",
+    logging_dir="./logs",
+    output_dir="./results",
+    overwrite_output_dir=True,
+    learning_rate=5e-5,
+)
 
-        outputs = model(batch_inputs, batch_masks)
-        loss = criterion(outputs.squeeze(), batch_labels.float())
-        loss.backward()
-        optimizer.step()
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    compute_metrics=lambda pred: {
+        "keys": pred.keys() if isinstance(pred, dict) else None,
+        "predictions_shape": pred.predictions.shape if hasattr(pred, 'predictions') else None,
+        "label_ids_shape": pred.label_ids.shape if hasattr(pred, 'label_ids') else None
+    }
+)
 
-    print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item()}')
+train_dataloader = DataLoader(train_dataset, batch_size=training_args.per_device_train_batch_size, shuffle=True)
+eval_dataloader = DataLoader(test_dataset, batch_size=training_args.per_device_eval_batch_size)
 
-# Evaluate BERT Model
+# Fine-tune BERT
 
-model.eval()
-with torch.no_grad():
-    outputs = model(test_inputs, test_masks)
-    predictions = torch.round(torch.sigmoid(outputs)).squeeze()
-    accuracy = accuracy_score(test_labels.numpy(), predictions.numpy())
-    print(f'Accuracy: {accuracy}')
-    
-# Extract BERT embeddings for entire dataset
-
-model.eval()
-with torch.no_grad():
-    all_outputs = model(input_ids, attention_masks).squeeze().numpy()
-
+for step, batch in enumerate(train_dataloader):
+    inputs = {key: value.to(trainer.args.device) for key, value in batch.items()}
+    print(f"Step {step}, Inputs: {inputs.keys()}")  # Print inputs keys
+    trainer.train()
 # Train LightGBM classifier
+lgbm_classifier = LGBMClassifier()
+lgbm_classifier.fit(X_train, y_train)
 
-X_train, X_test, y_train, y_test = train_test_split(all_outputs, labels.numpy(), test_size=0.2, random_state=42)
-train_data = lgb.Dataset(X_train, label=y_train)
-test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+# Predict labels on the test set
 
-params = {
-    'objective': 'binary',
-    'metric': 'binary_error',
-    'num_leaves': 31,
-    'learning_rate': 0.05,
-    'feature_fraction': 0.9
-}
+y_pred = lgbm_classifier.predict(X_test)
 
-num_round = 100
-bst = lgb.train(params, train_data, num_round, valid_sets=[test_data], early_stopping_rounds=10, verbose_eval=10)
+# Calculate evaluation metrics
 
-# Evaluate LightGBM classifier
-
-y_pred = np.round(bst.predict(X_test, num_iteration=bst.best_iteration))
 accuracy = accuracy_score(y_test, y_pred)
-print(f"LightGBM Accuracy: {accuracy}")
+precision = precision_score(y_test, y_pred, pos_label='Fake')
+recall = recall_score(y_test, y_pred, pos_label='Fake')
+f1 = f1_score(y_test, y_pred, pos_label='Fake')
+classification_rep = classification_report(y_test, y_pred)
+
+print("Accuracy:", accuracy)
+print("Precision (Fake):", precision)
+print("Recall (Fake):", recall)
+print("F1-score (Fake):", f1)
+print("Classification Report:\n", classification_rep)
 
 
 
