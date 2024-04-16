@@ -1,140 +1,151 @@
-#Practise
-
-#Setup Environment
-
-import torch
-import pandas as pd
-from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-import lightgbm as lgb
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score,precision_score,recall_score,f1_score,classification_report
-
-
-#Load BERT
-
-model_name = 'bert-base-uncased'
-tokenizer = BertTokenizer.from_pretrained(model_name)
-model = BertForSequenceClassification.from_pretrained(model_name)
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import torch
+from transformers import BertForSequenceClassification, BertTokenizer, AdamW, get_linear_schedule_with_warmup
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from tqdm import tqdm
+import nltk
+from nltk.corpus import stopwords
+import string
 
 # Load Dataset
+true_data = pd.read_csv('gossipcop_real.csv')
+fake_data = pd.read_csv('gossipcop_fake.csv')
 
-true_data = pd.read_csv('True.csv')
-fake_data = pd.read_csv('Fake.csv')
+# Preprocess the text data
+def preprocess_text(text):
+    text = text.lower()
+    text = text.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
+    text = ''.join([char for char in text if char.isalnum() or char in [' ', "'"]])
+    return text
 
-# Generate labels for True/Fake news
+true_data['title'] = true_data['title'].apply(preprocess_text)
+fake_data['title'] = fake_data['title'].apply(preprocess_text)
 
-true_data['Target'] = ['True']*len(true_data)
-fake_data['Target'] = ['Fake']*len(fake_data)
+# Generate labels True/Fake under new Target Column in 'true_data' and 'fake_data'
+true_data['Target'] = ['True'] * len(true_data)
+fake_data['Target'] = ['Fake'] * len(fake_data)
 
-# Merge and shuffle data
-
+# Merge 'true_data' and 'fake_data', by random mixing into a single df called 'data'
 fake_news_data = pd.concat([true_data, fake_data]).sample(frac=1).reset_index(drop=True)
 
-# Split the dataset into training and testing sets
+# Convert to lowercase
+fake_news_data['title'] = fake_news_data['title'].apply(lambda x: x.lower())
 
-train_data, test_data = train_test_split(fake_news_data, test_size=0.2, random_state=42)
+# Removing stopwords
+nltk.download('stopwords')
+stop = stopwords.words('english')
+fake_news_data['title'] = fake_news_data['title'].apply(lambda x: ' '.join([word for word in x.split() if word not in (stop)]))
 
-# Define BERT tokenizer and model
+# Remove punctuation
+def punctuation_removal(text):
+    all_list = [char for char in text if char not in string.punctuation]
+    clean_str = ''.join(all_list)
+    return clean_str
 
+fake_news_data['title'] = fake_news_data['title'].apply(punctuation_removal)
+
+# Load BERT tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
 
-#Tokenization of text using BERT tokenizer
+# Tokenize input text and pad/truncate sequences
+max_length = 128  # Maximum sequence length
+tokenized_texts = [tokenizer.encode(text, add_special_tokens=True, max_length=max_length, truncation=True) for text in fake_news_data['title']]
 
-def tokenize_data(data):
-    tokenized_data = tokenizer(data['title'].tolist(), padding=True, truncation=True, return_tensors="pt")
-    tokenized_data['labels'] = torch.tensor([0 if label == 'True' else 1 for label in data['Target'].tolist()])
-    return tokenized_data
+# Pad sequences
+input_ids = torch.nn.utils.rnn.pad_sequence([torch.tensor(tokenized_text) for tokenized_text in tokenized_texts], batch_first=True)
 
-train_tokenized = tokenize_data(train_data)
-test_tokenized = tokenize_data(test_data)
+# Create attention masks
+attention_masks = [[int(token_id > 0) for token_id in input_id] for input_id in input_ids]
 
+# Prepare Labels
+labels = [1 if label == 'Fake' else 0 for label in fake_news_data['Target']]
 
-# Custom Dataset class
+# Convert data to PyTorch tensors
+input_ids = torch.tensor(input_ids)
+attention_masks = torch.tensor(attention_masks)
+labels = torch.tensor(labels)
 
-class NewsDataset(Dataset):
-    def __init__(self, tokenized_data):
-        self.input_ids = tokenized_data['input_ids']
-        self.attention_mask = tokenized_data['attention_mask']
-        self.labels = tokenized_data['labels']
+# Split data into training and testing sets
+train_inputs, test_inputs, train_masks, test_masks, train_labels, test_labels = train_test_split(input_ids, attention_masks, labels, test_size=0.2, random_state=42)
 
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        return {
-            'input_ids': self.input_ids[idx],
-            'attention_mask': self.attention_mask[idx],
-            'labels': self.labels[idx]
-        }
-
-# Define data loaders
-
-train_dataset = NewsDataset(train_tokenized)
-test_dataset = NewsDataset(test_tokenized)
-
-training_args = TrainingArguments(
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    num_train_epochs=3,
-    evaluation_strategy="epoch",
-    logging_dir="./logs",
-    output_dir="./results",
-    overwrite_output_dir=True,
-    learning_rate=5e-5,
+# Define BERT model for sequence classification with fewer layers
+model = BertForSequenceClassification.from_pretrained(
+    'bert-base-uncased',
+    num_labels=2,  
+    output_attentions=False,
+    output_hidden_states=False,
+    num_hidden_layers=6  # Set the number of layers (default is 12)
 )
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    compute_metrics=lambda pred: {
-        "keys": pred.keys() if isinstance(pred, dict) else None,
-        "predictions_shape": pred.predictions.shape if hasattr(pred, 'predictions') else None,
-        "label_ids_shape": pred.label_ids.shape if hasattr(pred, 'label_ids') else None
-    }
-)
+# Fine-tuning BERT model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
 
-train_dataloader = DataLoader(train_dataset, batch_size=training_args.per_device_train_batch_size, shuffle=True)
-eval_dataloader = DataLoader(test_dataset, batch_size=training_args.per_device_eval_batch_size)
+# Define optimizer and learning rate scheduler
+optimizer = AdamW(model.parameters(), lr=2e-5, eps=1e-8)
+epochs = 3
+total_steps = len(train_inputs) * epochs
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
-# Fine-tune BERT
+# Data loaders
+batch_size = 32
+train_data = TensorDataset(train_inputs, train_masks, train_labels)
+train_sampler = RandomSampler(train_data)
+train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=batch_size)
 
-for step, batch in enumerate(train_dataloader):
-    inputs = {key: value.to(trainer.args.device) for key, value in batch.items()}
-    print(f"Step {step}, Inputs: {inputs.keys()}")  # Print inputs keys
-    trainer.train()
-# Train LightGBM classifier
-lgbm_classifier = LGBMClassifier()
-lgbm_classifier.fit(X_train, y_train)
+test_data = TensorDataset(test_inputs, test_masks, test_labels)
+test_sampler = SequentialSampler(test_data)
+test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
 
-# Predict labels on the test set
+# Training loop
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    for batch in train_dataloader:
+        input_ids, masks, labels = tuple(t.to(device) for t in batch)
+        model.zero_grad()
+        outputs = model(input_ids, token_type_ids=None, attention_mask=masks, labels=labels)
+        loss = outputs.loss
+        total_loss += loss.item()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Clip gradients to avoid exploding gradients
+        optimizer.step()
+        scheduler.step()
 
-y_pred = lgbm_classifier.predict(X_test)
+    avg_train_loss = total_loss / len(train_dataloader)
 
-# Calculate evaluation metrics
+    model.eval()
+    eval_loss, eval_accuracy = 0, 0
+    nb_eval_steps, nb_eval_examples = 0, 0
+    predictions, true_labels = [], []
 
-accuracy = accuracy_score(y_test, y_pred)
-precision = precision_score(y_test, y_pred, pos_label='Fake')
-recall = recall_score(y_test, y_pred, pos_label='Fake')
-f1 = f1_score(y_test, y_pred, pos_label='Fake')
-classification_rep = classification_report(y_test, y_pred)
+    for batch in test_dataloader:
+        input_ids, masks, labels = tuple(t.to(device) for t in batch)
+        with torch.no_grad():
+            outputs = model(input_ids, token_type_ids=None, attention_mask=masks)
+            logits = outputs.logits
 
-print("Accuracy:", accuracy)
-print("Precision (Fake):", precision)
-print("Recall (Fake):", recall)
-print("F1-score (Fake):", f1)
-print("Classification Report:\n", classification_rep)
+        logits = logits.detach().cpu().numpy()
+        label_ids = labels.to('cpu').numpy()
 
+        predictions.append(logits)
+        true_labels.append(label_ids)
 
-
-
-
-
-
-
-
-
+    predictions = np.concatenate(predictions, axis=0)
+    true_labels = np.concatenate(true_labels, axis=0)
+    preds_flat = np.argmax(predictions, axis=1).flatten()
+    labels_flat = true_labels.flatten()
+    accuracy = accuracy_score(labels_flat, preds_flat)
+    precision = precision_score(labels_flat, preds_flat)
+    recall = recall_score(labels_flat, preds_flat)
+    f1 = f1_score(labels_flat, preds_flat)
+    print(f'Epoch {epoch + 1}/{epochs}')
+    print(f'Training loss: {avg_train_loss}')
+    print(f'Accuracy: {accuracy}')
+    print(f'Precision: {precision}')
+    print(f'Recall: {recall}')
+    print(f'F1-score: {f1}')
+    print("\n")
