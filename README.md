@@ -27,4 +27,3 @@ Result on ISOT Dataset
 | Random Forest       | 94.09          | 94.09           | 94.09        | 94.09          |
 | BERT + LightGBM     | 98.63          | 98.79           | 98.55        | 98.67          |
 
-![alt text](image-2.png)
