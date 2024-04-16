@@ -6,9 +6,6 @@ import torch
 from transformers import BertForSequenceClassification, BertTokenizer, AdamW, get_linear_schedule_with_warmup
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
-import nltk
-from nltk.corpus import stopwords
-import string
 
 # Load Dataset
 true_data = pd.read_csv('gossipcop_real.csv')
@@ -30,22 +27,6 @@ fake_data['Target'] = ['Fake'] * len(fake_data)
 
 # Merge 'true_data' and 'fake_data', by random mixing into a single df called 'data'
 fake_news_data = pd.concat([true_data, fake_data]).sample(frac=1).reset_index(drop=True)
-
-# Convert to lowercase
-fake_news_data['title'] = fake_news_data['title'].apply(lambda x: x.lower())
-
-# Removing stopwords
-nltk.download('stopwords')
-stop = stopwords.words('english')
-fake_news_data['title'] = fake_news_data['title'].apply(lambda x: ' '.join([word for word in x.split() if word not in (stop)]))
-
-# Remove punctuation
-def punctuation_removal(text):
-    all_list = [char for char in text if char not in string.punctuation]
-    clean_str = ''.join(all_list)
-    return clean_str
-
-fake_news_data['title'] = fake_news_data['title'].apply(punctuation_removal)
 
 # Load BERT tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
@@ -77,7 +58,7 @@ model = BertForSequenceClassification.from_pretrained(
     num_labels=2,  
     output_attentions=False,
     output_hidden_states=False,
-    num_hidden_layers=6  # Set the number of layers (default is 12)
+    num_hidden_layers=6 
 )
 
 # Fine-tuning BERT model
